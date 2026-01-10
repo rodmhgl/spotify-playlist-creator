@@ -4,7 +4,7 @@ Create Spotify playlists from TSV files containing song titles and artists.
 
 ## Prerequisites
 
-You need Python 3.9 or later and a Spotify Developer account. The app requires two OAuth scopes: `playlist-modify-public` and `playlist-modify-private`.
+You need Python 3.x (tested with Python 3.9 and later) and a Spotify Developer account. The app requires two OAuth scopes: `playlist-modify-public` and `playlist-modify-private`.
 
 ## Installation
 
@@ -23,7 +23,14 @@ SPOTIFY_CLIENT_ID=your_client_id_here
 SPOTIFY_CLIENT_SECRET=your_client_secret_here
 ```
 
+Optional environment variables:
+
+- `SPOTIFY_REDIRECT_URI` — Custom redirect URI (default: `http://127.0.0.1:8888/callback`). Must match your Spotify app settings.
+- `SPOTIFY_CACHE_PATH` — Custom path for the token cache file (default: `.spotify_cache`).
+
 On first run, the tool will prompt you to authorize via browser. After authorization, the token is cached to `.spotify_cache` for subsequent runs.
+
+**Security note**: The `.spotify_cache` file contains OAuth tokens. It is included in `.gitignore` and should not be committed to version control.
 
 ## Usage
 

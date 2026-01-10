@@ -10,6 +10,8 @@ import sys
 from difflib import SequenceMatcher
 
 import spotipy
+from dotenv import load_dotenv
+from spotipy.oauth2 import SpotifyOAuth
 
 # Keywords that indicate non-original versions (karaoke, covers, etc.)
 KARAOKE_KEYWORDS = {
@@ -17,8 +19,6 @@ KARAOKE_KEYWORDS = {
     "tribute", "in the style of", "made famous by",
     "originally performed", "sing along", "minus one"
 }
-from dotenv import load_dotenv
-from spotipy.oauth2 import SpotifyOAuth
 
 
 def parse_args():
@@ -115,12 +115,15 @@ def parse_tsv(filepath):
 def authenticate(client_id, client_secret):
     """Authenticate with Spotify and return client."""
     try:
+        redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+        cache_path = os.getenv("SPOTIFY_CACHE_PATH", ".spotify_cache")
+
         auth_manager = SpotifyOAuth(
             client_id=client_id,
             client_secret=client_secret,
-            redirect_uri="http://127.0.0.1:8888/callback",
+            redirect_uri=redirect_uri,
             scope="playlist-modify-public playlist-modify-private",
-            cache_path=".spotify_cache",
+            cache_path=cache_path,
             open_browser=False
         )
 
@@ -131,12 +134,45 @@ def authenticate(client_id, client_secret):
             print(f"\nOpen this URL in your browser to authorize:\n{auth_url}\n")
             response_url = input("Paste the redirect URL here: ").strip()
 
-            code = auth_manager.parse_response_code(response_url)
+            if not response_url:
+                print(
+                    "Error: No redirect URL provided. "
+                    "After approving access, copy the full URL from your browser.",
+                    file=sys.stderr
+                )
+                sys.exit(1)
+
+            try:
+                code = auth_manager.parse_response_code(response_url)
+            except Exception:
+                print(
+                    "Error: Invalid redirect URL format. "
+                    "Paste the full URL from your browser's address bar.",
+                    file=sys.stderr
+                )
+                sys.exit(1)
+
+            if not code:
+                print(
+                    "Error: Authorization code not found in redirect URL. "
+                    "Ensure you pasted the entire URL including the 'code' parameter.",
+                    file=sys.stderr
+                )
+                sys.exit(1)
+
             auth_manager.get_access_token(code)
 
         sp = spotipy.Spotify(auth_manager=auth_manager)
         sp.current_user()
         return sp
+    except spotipy.SpotifyException as e:
+        if e.http_status == 401:
+            print("Error: Invalid or expired credentials. Check your client ID/secret.", file=sys.stderr)
+        elif e.http_status == 403:
+            print("Error: Insufficient permissions. Ensure app has required scopes.", file=sys.stderr)
+        else:
+            print(f"Error: Spotify API error ({e.http_status}): {e.msg}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"Error: Spotify authentication failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -152,10 +188,13 @@ def score_track_match(track, expected_title, expected_artist):
     - Popularity bonus: 0-10 points (scaled from Spotify's 0-100)
     - Karaoke keyword penalty: -50 points if detected
 
+    Scores can be negative (karaoke tracks). Tracks with score <= 0 are excluded.
+
     Returns (score, track_name, artist_name) tuple.
     """
     track_name = track["name"]
-    artist_name = track["artists"][0]["name"]
+    artists = track.get("artists") or []
+    artist_name = artists[0].get("name", "") if artists else ""
     album_name = track.get("album", {}).get("name", "")
     popularity = track.get("popularity", 0)
 
@@ -183,7 +222,7 @@ def score_track_match(track, expected_title, expected_artist):
             score -= 50
             break
 
-    return max(0, score), track_name, artist_name
+    return score, track_name, artist_name
 
 
 def search_track(sp, title, artist):
@@ -197,24 +236,38 @@ def search_track(sp, title, artist):
     (None, 0, None, None) otherwise.
     """
     candidates = []
+    candidate_ids = set()
 
     # First pass: field-specific search
     query = f'track:{title} artist:{artist}'
-    results = sp.search(q=query, type="track", limit=10)
-    candidates.extend(results["tracks"]["items"])
+    try:
+        results = sp.search(q=query, type="track", limit=10)
+        for track in results["tracks"]["items"]:
+            candidates.append(track)
+            candidate_ids.add(track["id"])
+    except spotipy.SpotifyException as e:
+        print(f"Spotify API error searching for '{title}': {e.msg}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error searching for '{title}': {e}", file=sys.stderr)
 
     # Second pass: fallback search (may find different results)
     fallback_query = f'{title} {artist}'
-    results = sp.search(q=fallback_query, type="track", limit=10)
-    for track in results["tracks"]["items"]:
-        if track["id"] not in [c["id"] for c in candidates]:
-            candidates.append(track)
+    try:
+        results = sp.search(q=fallback_query, type="track", limit=10)
+        for track in results["tracks"]["items"]:
+            if track["id"] not in candidate_ids:
+                candidates.append(track)
+                candidate_ids.add(track["id"])
+    except spotipy.SpotifyException as e:
+        print(f"Spotify API error in fallback search for '{title}': {e.msg}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error in fallback search for '{title}': {e}", file=sys.stderr)
 
     if not candidates:
         return None, 0, None, None
 
-    # Score all candidates and pick the best
-    best_score = -1
+    # Score all candidates and pick the best (tracks with negative scores are excluded)
+    best_score = 0  # Minimum threshold - exclude karaoke/cover versions with negative scores
     best_track = None
     best_name = None
     best_artist = None
@@ -227,6 +280,9 @@ def search_track(sp, title, artist):
             best_name = track_name
             best_artist = artist_name
 
+    if best_track is None:
+        return None, 0, None, None
+
     return best_track["id"], best_score, best_name, best_artist
 
 
@@ -234,24 +290,41 @@ def create_playlist(sp, track_ids, name, public, description):
     """
     Create a Spotify playlist and add tracks.
 
-    Returns the playlist URL.
+    Returns the playlist URL, or None if creation failed.
     """
-    user_id = sp.current_user()["id"]
+    try:
+        user_id = sp.current_user()["id"]
 
-    playlist = sp.user_playlist_create(
-        user=user_id,
-        name=name,
-        public=public,
-        description=description
-    )
+        playlist = sp.user_playlist_create(
+            user=user_id,
+            name=name,
+            public=public,
+            description=description
+        )
 
-    playlist_id = playlist["id"]
+        playlist_id = playlist["id"]
+        tracks_added = 0
 
-    for i in range(0, len(track_ids), 100):
-        batch = track_ids[i:i + 100]
-        sp.playlist_add_items(playlist_id, batch)
+        for i in range(0, len(track_ids), 100):
+            batch = track_ids[i:i + 100]
+            try:
+                sp.playlist_add_items(playlist_id, batch)
+                tracks_added += len(batch)
+            except spotipy.SpotifyException as e:
+                print(f"Error adding tracks (batch {i//100 + 1}): {e.msg}", file=sys.stderr)
+                print(f"Added {tracks_added}/{len(track_ids)} tracks before failure.", file=sys.stderr)
 
-    return playlist["external_urls"]["spotify"]
+        return playlist["external_urls"]["spotify"]
+
+    except spotipy.SpotifyException as e:
+        if e.http_status == 403:
+            print("Error: Permission denied. Check playlist creation permissions.", file=sys.stderr)
+        else:
+            print(f"Error creating playlist: {e.msg}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"Error creating playlist: {e}", file=sys.stderr)
+        return None
 
 
 def main():
@@ -285,8 +358,11 @@ def main():
         print(f'Would have added {len(found_ids)} tracks to playlist "{args.name}"')
     elif found_ids:
         url = create_playlist(sp, found_ids, args.name, args.public, args.description)
-        print(f'Created playlist: "{args.name}"')
-        print(f"URL: {url}")
+        if url:
+            print(f'Created playlist: "{args.name}"')
+            print(f"URL: {url}")
+        else:
+            print("Failed to create playlist.", file=sys.stderr)
     else:
         print("No tracks found. Playlist not created.")
 
