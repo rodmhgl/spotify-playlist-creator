@@ -112,67 +112,72 @@ def parse_tsv(filepath):
     return tracks
 
 
+def _get_authorization_code(auth_manager):
+    """
+    Prompt user for OAuth authorization and return the authorization code.
+    Exits with error if authorization fails.
+    """
+    auth_url = auth_manager.get_authorize_url()
+    print(f"\nOpen this URL in your browser to authorize:\n{auth_url}\n")
+    response_url = input("Paste the redirect URL here: ").strip()
+
+    if not response_url:
+        print(
+            "Error: No redirect URL provided. "
+            "After approving access, copy the full URL from your browser.",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    try:
+        code = auth_manager.parse_response_code(response_url)
+        if not code:
+            raise ValueError("No code in response")
+        return code
+    except Exception:
+        print(
+            "Error: Could not extract authorization code from URL. "
+            "Paste the full URL from your browser's address bar.",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+
+def _handle_spotify_auth_error(error):
+    """Print appropriate error message for Spotify authentication errors and exit."""
+    error_messages = {
+        401: "Invalid or expired credentials. Check your client ID/secret.",
+        403: "Insufficient permissions. Ensure app has required scopes.",
+    }
+    message = error_messages.get(error.http_status, f"Spotify API error ({error.http_status}): {error.msg}")
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
 def authenticate(client_id, client_secret):
     """Authenticate with Spotify and return client."""
+    redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+    cache_path = os.getenv("SPOTIFY_CACHE_PATH", ".spotify_cache")
+
+    auth_manager = SpotifyOAuth(
+        client_id=client_id,
+        client_secret=client_secret,
+        redirect_uri=redirect_uri,
+        scope="playlist-modify-public playlist-modify-private",
+        cache_path=cache_path,
+        open_browser=False
+    )
+
+    if not auth_manager.get_cached_token():
+        code = _get_authorization_code(auth_manager)
+        auth_manager.get_access_token(code)
+
     try:
-        redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
-        cache_path = os.getenv("SPOTIFY_CACHE_PATH", ".spotify_cache")
-
-        auth_manager = SpotifyOAuth(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=redirect_uri,
-            scope="playlist-modify-public playlist-modify-private",
-            cache_path=cache_path,
-            open_browser=False
-        )
-
-        # Check if we have a cached token
-        token_info = auth_manager.get_cached_token()
-        if not token_info:
-            auth_url = auth_manager.get_authorize_url()
-            print(f"\nOpen this URL in your browser to authorize:\n{auth_url}\n")
-            response_url = input("Paste the redirect URL here: ").strip()
-
-            if not response_url:
-                print(
-                    "Error: No redirect URL provided. "
-                    "After approving access, copy the full URL from your browser.",
-                    file=sys.stderr
-                )
-                sys.exit(1)
-
-            try:
-                code = auth_manager.parse_response_code(response_url)
-            except Exception:
-                print(
-                    "Error: Invalid redirect URL format. "
-                    "Paste the full URL from your browser's address bar.",
-                    file=sys.stderr
-                )
-                sys.exit(1)
-
-            if not code:
-                print(
-                    "Error: Authorization code not found in redirect URL. "
-                    "Ensure you pasted the entire URL including the 'code' parameter.",
-                    file=sys.stderr
-                )
-                sys.exit(1)
-
-            auth_manager.get_access_token(code)
-
         sp = spotipy.Spotify(auth_manager=auth_manager)
         sp.current_user()
         return sp
     except spotipy.SpotifyException as e:
-        if e.http_status == 401:
-            print("Error: Invalid or expired credentials. Check your client ID/secret.", file=sys.stderr)
-        elif e.http_status == 403:
-            print("Error: Insufficient permissions. Ensure app has required scopes.", file=sys.stderr)
-        else:
-            print(f"Error: Spotify API error ({e.http_status}): {e.msg}", file=sys.stderr)
-        sys.exit(1)
+        _handle_spotify_auth_error(e)
     except Exception as e:
         print(f"Error: Spotify authentication failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -217,12 +222,40 @@ def score_track_match(track, expected_title, expected_artist):
 
     # Karaoke keyword penalty (-50 points)
     combined_text = f"{track_name} {artist_name} {album_name}".lower()
-    for keyword in KARAOKE_KEYWORDS:
-        if keyword in combined_text:
-            score -= 50
-            break
+    if any(keyword in combined_text for keyword in KARAOKE_KEYWORDS):
+        score -= 50
 
     return score, track_name, artist_name
+
+
+def _execute_search(sp, query, title):
+    """Execute a Spotify search and return track results, handling errors gracefully."""
+    try:
+        results = sp.search(q=query, type="track", limit=10)
+        return results["tracks"]["items"]
+    except spotipy.SpotifyException as e:
+        print(f"Spotify API error searching for '{title}': {e.msg}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error searching for '{title}': {e}", file=sys.stderr)
+    return []
+
+
+def _find_best_match(candidates, title, artist):
+    """
+    Score all candidate tracks and return the best match above threshold.
+
+    Returns (track_id, score, matched_title, matched_artist) or (None, 0, None, None).
+    """
+    best_score = 0
+    best_match = None
+
+    for track in candidates:
+        score, track_name, artist_name = score_track_match(track, title, artist)
+        if score > best_score:
+            best_score = score
+            best_match = (track["id"], score, track_name, artist_name)
+
+    return best_match if best_match else (None, 0, None, None)
 
 
 def search_track(sp, title, artist):
@@ -236,54 +269,42 @@ def search_track(sp, title, artist):
     (None, 0, None, None) otherwise.
     """
     candidates = []
-    candidate_ids = set()
+    seen_ids = set()
 
-    # First pass: field-specific search
-    query = f'track:{title} artist:{artist}'
-    try:
-        results = sp.search(q=query, type="track", limit=10)
-        for track in results["tracks"]["items"]:
-            candidates.append(track)
-            candidate_ids.add(track["id"])
-    except spotipy.SpotifyException as e:
-        print(f"Spotify API error searching for '{title}': {e.msg}", file=sys.stderr)
-    except Exception as e:
-        print(f"Error searching for '{title}': {e}", file=sys.stderr)
+    queries = [
+        f'track:{title} artist:{artist}',
+        f'{title} {artist}',
+    ]
 
-    # Second pass: fallback search (may find different results)
-    fallback_query = f'{title} {artist}'
-    try:
-        results = sp.search(q=fallback_query, type="track", limit=10)
-        for track in results["tracks"]["items"]:
-            if track["id"] not in candidate_ids:
+    for query in queries:
+        for track in _execute_search(sp, query, title):
+            if track["id"] not in seen_ids:
                 candidates.append(track)
-                candidate_ids.add(track["id"])
-    except spotipy.SpotifyException as e:
-        print(f"Spotify API error in fallback search for '{title}': {e.msg}", file=sys.stderr)
-    except Exception as e:
-        print(f"Error in fallback search for '{title}': {e}", file=sys.stderr)
+                seen_ids.add(track["id"])
 
     if not candidates:
         return None, 0, None, None
 
-    # Score all candidates and pick the best (tracks with negative scores are excluded)
-    best_score = 0  # Minimum threshold - exclude karaoke/cover versions with negative scores
-    best_track = None
-    best_name = None
-    best_artist = None
+    return _find_best_match(candidates, title, artist)
 
-    for track in candidates:
-        score, track_name, artist_name = score_track_match(track, title, artist)
-        if score > best_score:
-            best_score = score
-            best_track = track
-            best_name = track_name
-            best_artist = artist_name
 
-    if best_track is None:
-        return None, 0, None, None
+def _add_tracks_in_batches(sp, playlist_id, track_ids):
+    """Add tracks to playlist in batches of 100, reporting any failures."""
+    tracks_added = 0
+    batch_size = 100
 
-    return best_track["id"], best_score, best_name, best_artist
+    for i in range(0, len(track_ids), batch_size):
+        batch = track_ids[i:i + batch_size]
+        try:
+            sp.playlist_add_items(playlist_id, batch)
+            tracks_added += len(batch)
+        except spotipy.SpotifyException as e:
+            batch_num = i // batch_size + 1
+            print(f"Error adding tracks (batch {batch_num}): {e.msg}", file=sys.stderr)
+            print(f"Added {tracks_added}/{len(track_ids)} tracks before failure.", file=sys.stderr)
+            break
+
+    return tracks_added
 
 
 def create_playlist(sp, track_ids, name, public, description):
@@ -294,7 +315,6 @@ def create_playlist(sp, track_ids, name, public, description):
     """
     try:
         user_id = sp.current_user()["id"]
-
         playlist = sp.user_playlist_create(
             user=user_id,
             name=name,
@@ -302,25 +322,15 @@ def create_playlist(sp, track_ids, name, public, description):
             description=description
         )
 
-        playlist_id = playlist["id"]
-        tracks_added = 0
-
-        for i in range(0, len(track_ids), 100):
-            batch = track_ids[i:i + 100]
-            try:
-                sp.playlist_add_items(playlist_id, batch)
-                tracks_added += len(batch)
-            except spotipy.SpotifyException as e:
-                print(f"Error adding tracks (batch {i//100 + 1}): {e.msg}", file=sys.stderr)
-                print(f"Added {tracks_added}/{len(track_ids)} tracks before failure.", file=sys.stderr)
-
+        _add_tracks_in_batches(sp, playlist["id"], track_ids)
         return playlist["external_urls"]["spotify"]
 
     except spotipy.SpotifyException as e:
-        if e.http_status == 403:
-            print("Error: Permission denied. Check playlist creation permissions.", file=sys.stderr)
-        else:
-            print(f"Error creating playlist: {e.msg}", file=sys.stderr)
+        error_messages = {
+            403: "Permission denied. Check playlist creation permissions.",
+        }
+        message = error_messages.get(e.http_status, f"Spotify API error: {e.msg}")
+        print(f"Error: {message}", file=sys.stderr)
         return None
     except Exception as e:
         print(f"Error creating playlist: {e}", file=sys.stderr)
