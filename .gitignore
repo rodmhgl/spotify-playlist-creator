@@ -1,3 +1,5 @@
 .env
 .spotify_cache
 venv/
+__pycache__/
+*.tsv
