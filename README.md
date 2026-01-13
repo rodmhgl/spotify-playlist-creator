@@ -2,35 +2,27 @@
 
 Create Spotify playlists from TSV files containing song titles and artists.
 
-## Prerequisites
-
-You need Python 3.x (tested with Python 3.9 and later) and a Spotify Developer account. The app requires two OAuth scopes: `playlist-modify-public` and `playlist-modify-private`.
-
-## Installation
+## Quick Start
 
 ```bash
 pip install -r requirements.txt
+python spotify_playlist.py tracks.tsv -n "My Playlist"
 ```
 
-## Spotify API Setup
+## Setup
 
-Go to [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard) and create a new app. Set the redirect URI to `http://127.0.0.1:8888/callback` in your app settings.
+**Requirements:** Python 3.9+, Spotify Developer account
 
-Copy the Client ID and Client Secret from your app. Set them as environment variables or create a `.env` file in the project directory:
+1. Create an app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard)
+2. Set redirect URI to `http://127.0.0.1:8888/callback` in app settings
+3. Create `.env` file with your credentials:
 
 ```
 SPOTIFY_CLIENT_ID=your_client_id_here
 SPOTIFY_CLIENT_SECRET=your_client_secret_here
 ```
 
-Optional environment variables:
-
-- `SPOTIFY_REDIRECT_URI` — Custom redirect URI (default: `http://127.0.0.1:8888/callback`). Must match your Spotify app settings.
-- `SPOTIFY_CACHE_PATH` — Custom path for the token cache file (default: `.spotify_cache`).
-
-On first run, the tool will prompt you to authorize via browser. After authorization, the token is cached to `.spotify_cache` for subsequent runs.
-
-**Security note**: The `.spotify_cache` file contains OAuth tokens. It is included in `.gitignore` and should not be committed to version control.
+On first run, authorize via browser. Token is cached to `.spotify_cache` for subsequent runs.
 
 ## Usage
 
@@ -38,35 +30,17 @@ On first run, the tool will prompt you to authorize via browser. After authoriza
 python spotify_playlist.py <input_file> --name "<playlist_name>" [options]
 ```
 
-Options:
-- `-n, --name` (required) — Playlist name
-- `-p, --public` — Make playlist public (default: private)
-- `-d, --description` — Custom description
-- `--dry-run` — Search without creating the playlist
-- `-v, --verbose` — Show per-track search results
+| Option | Description |
+|--------|-------------|
+| `-n, --name` | Playlist name (required) |
+| `-p, --public` | Make playlist public (default: private) |
+| `-d, --description` | Custom description |
+| `--dry-run` | Search without creating playlist |
+| `-v, --verbose` | Show per-track search results |
 
-The input file should be tab-separated with a header row:
+## Input Format
 
-```
-Title	Artist
-Earth Angel	The Penguins
-Stand by Me	Ben E. King
-Bohemian Rhapsody	Queen
-```
-
-Additional columns after Artist are ignored.
-
-## Behavior Notes
-
-**Track matching**: The search uses a scoring system to filter out karaoke and cover versions. Tracks containing keywords like "karaoke", "instrumental", "cover", or "tribute" are heavily penalized.
-
-**Missing tracks**: When a track is not found, the tool skips it and continues. All unfound tracks are listed at the end. The exit code is 0 even if some tracks were not found. Exit code 1 is reserved for configuration errors (missing credentials, bad input file, auth failure).
-
-**Duplicates**: Not deduplicated. If your input contains the same song twice, it appears twice in the playlist.
-
-## Example
-
-Given `tracks.tsv`:
+Tab-separated file with header row. Additional columns are ignored.
 
 ```
 Title	Artist
@@ -75,13 +49,11 @@ Imagine	John Lennon
 Stairway to Heaven	Led Zeppelin
 ```
 
-Run:
+## Example
 
 ```bash
 python spotify_playlist.py tracks.tsv -n "Classic Rock" -v
 ```
-
-Output:
 
 ```
 Searching for 3 tracks...
@@ -92,3 +64,18 @@ Found: 3/3 tracks
 Created playlist: "Classic Rock"
 URL: https://open.spotify.com/playlist/xxxxx
 ```
+
+## Behavior
+
+- **Track matching:** Uses scoring to filter karaoke/cover versions. Keywords like "karaoke", "instrumental", "cover" are penalized.
+- **Missing tracks:** Skipped and listed at end. Exit code 0 even if some not found.
+- **Duplicates:** Not deduplicated. Same song twice in input = twice in playlist.
+
+## Environment Variables
+
+| Variable | Required | Default |
+|----------|----------|---------|
+| `SPOTIFY_CLIENT_ID` | Yes | — |
+| `SPOTIFY_CLIENT_SECRET` | Yes | — |
+| `SPOTIFY_REDIRECT_URI` | No | `http://127.0.0.1:8888/callback` |
+| `SPOTIFY_CACHE_PATH` | No | `.spotify_cache` |
