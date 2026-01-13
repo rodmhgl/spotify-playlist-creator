@@ -9,9 +9,10 @@ import os
 import sys
 from difflib import SequenceMatcher
 
+import requests
 import spotipy
 from dotenv import load_dotenv
-from spotipy.oauth2 import SpotifyOAuth
+from spotipy.oauth2 import SpotifyOAuth, SpotifyOauthError
 
 # Keywords that indicate non-original versions (karaoke, covers, etc.)
 KARAOKE_KEYWORDS = {
@@ -134,7 +135,7 @@ def _get_authorization_code(auth_manager):
         if not code:
             raise ValueError("No code in response")
         return code
-    except Exception:
+    except ValueError:
         print(
             "Error: Could not extract authorization code from URL. "
             "Paste the full URL from your browser's address bar.",
@@ -178,7 +179,7 @@ def authenticate(client_id, client_secret):
         return sp
     except spotipy.SpotifyException as e:
         _handle_spotify_auth_error(e)
-    except Exception as e:
+    except (requests.RequestException, SpotifyOauthError) as e:
         print(f"Error: Spotify authentication failed: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -235,7 +236,7 @@ def _execute_search(sp, query, title):
         return results["tracks"]["items"]
     except spotipy.SpotifyException as e:
         print(f"Spotify API error searching for '{title}': {e.msg}", file=sys.stderr)
-    except Exception as e:
+    except requests.RequestException as e:
         print(f"Error searching for '{title}': {e}", file=sys.stderr)
     return []
 
@@ -332,7 +333,7 @@ def create_playlist(sp, track_ids, name, public, description):
         message = error_messages.get(e.http_status, f"Spotify API error: {e.msg}")
         print(f"Error: {message}", file=sys.stderr)
         return None
-    except Exception as e:
+    except requests.RequestException as e:
         print(f"Error creating playlist: {e}", file=sys.stderr)
         return None
 
