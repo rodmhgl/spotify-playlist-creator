@@ -169,7 +169,16 @@ def authenticate(client_id, client_secret):
         open_browser=False
     )
 
-    if not auth_manager.get_cached_token():
+    try:
+        cached_token = auth_manager.get_cached_token()
+    except SpotifyOauthError as e:
+        # Refresh failed (e.g. revoked token); discard the stale cache and re-authorize
+        print(f"Warning: Cached token is no longer valid ({e}). Re-authorization required.", file=sys.stderr)
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+        cached_token = None
+
+    if not cached_token:
         code = _get_authorization_code(auth_manager)
         auth_manager.get_access_token(code)
 
